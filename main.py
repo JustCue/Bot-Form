@@ -18,9 +18,15 @@ async def on_ready():
     except Exception as e:
         print(f"❌ Failed to sync commands: {e}")
 
-# Generate formatted link as Report-0001, Report-0002, etc.
-def generate_transcript_link(message: discord.Message, index: int) -> str:
-    return f"[Report-{index:04d}](<{message.jump_url}>)"
+def generate_transcript_link(message: discord.Message, *args) -> str:
+    for attachment in message.attachments:
+        if attachment.filename.endswith(".html"):
+            # Match any numeric value in the filename, regardless of prefix
+            match = re.search(r"(\d+)", attachment.filename)
+            if match:
+                report_number = int(match.group(1))
+                return f"[Report-{report_number:04d}](<{message.jump_url}>)"
+    return f"[Transcript](<{message.jump_url}>)"
 
 async def get_transcript_options(guild: discord.Guild, channel_name_contains="transcript") -> list[str]:
     transcript_channel = next((c for c in guild.text_channels if channel_name_contains in c.name.lower()), None)
@@ -103,7 +109,7 @@ class TranscriptView(discord.ui.View):
 
 # Punishment dictionary
 punishments = {
-    "Custom Punishment": { "Custom": "Manual Entry" },
+    "Custom Punishment": {},
     "Spamming": {
         "Strike 1": "30‑Min /timeout",
         "Strike 2": "1 Day Ban",
@@ -226,6 +232,22 @@ punishments = {
     }
 }
 
+
+class CustomPunishmentModal(discord.ui.Modal):
+    def __init__(self, player: dict):
+        super().__init__(title="Custom Punishment")
+        self.player = player
+        self.reason = discord.ui.InputText(label="Reason", placeholder="Enter ban reason", style=discord.InputTextStyle.short)
+        self.duration = discord.ui.InputText(label="Duration", placeholder="Enter ban duration (e.g., 7 days)", style=discord.InputTextStyle.short)
+        self.add_item(self.reason)
+        self.add_item(self.duration)
+
+    async def callback(self, interaction: discord.Interaction):
+        reason_text = self.reason.value
+        duration_text = self.duration.value
+        transcripts = await get_transcript_options(interaction.guild)
+        # Use reason_text as offense, strike label "Custom", sanction as duration_text
+        await interaction.response.send_message("Select a transcript:", view=TranscriptView(transcripts, self.player, reason_text, "Custom", duration_text), ephemeral=True)
 
 # Strike selection
 async def show_strike_menu(interaction: discord.Interaction, player: dict, offense: str):
