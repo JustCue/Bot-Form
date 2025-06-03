@@ -237,8 +237,8 @@ class CustomPunishmentModal(discord.ui.Modal):
     def __init__(self, player: dict):
         super().__init__(title="Custom Punishment")
         self.player = player
-        self.reason = discord.ui.InputText(label="Reason", placeholder="Enter ban reason", style=discord.InputTextStyle.short)
-        self.duration = discord.ui.InputText(label="Duration", placeholder="Enter ban duration (e.g., 7 days)", style=discord.InputTextStyle.short)
+        self.reason = discord.ui.TextInput(label="Reason", placeholder="Enter ban reason", style=discord.TextStyle.short)
+        self.duration = discord.ui.TextInput(label="Duration", placeholder="Enter ban duration (e.g., 7 days)", style=discord.TextStyle.short)
         self.add_item(self.reason)
         self.add_item(self.duration)
 
@@ -246,7 +246,6 @@ class CustomPunishmentModal(discord.ui.Modal):
         reason_text = self.reason.value
         duration_text = self.duration.value
         transcripts = await get_transcript_options(interaction.guild)
-        # Use reason_text as offense, strike label "Custom", sanction as duration_text
         await interaction.response.send_message("Select a transcript:", view=TranscriptView(transcripts, self.player, reason_text, "Custom", duration_text), ephemeral=True)
 
 # Strike selection
@@ -338,11 +337,13 @@ async def show_offense_menu(interaction: discord.Interaction, player: dict):
             except:
                 pass
             offense = self.values[0]
-            if offense == "Custom Punishment":
-                await interaction2.response.send_message("Custom Punishment not implemented yet.", ephemeral=True)
-                return
             await interaction2.response.defer(ephemeral=True)
-            await show_strike_menu(interaction2, player, offense)
+            if offense == "Custom Punishment":
+                modal = CustomPunishmentModal(player)
+                await interaction2.response.send_modal(modal)
+            else:
+                await show_strike_menu(interaction2, player, offense)
+
 
     class OffenseView(discord.ui.View):
         def __init__(self):
