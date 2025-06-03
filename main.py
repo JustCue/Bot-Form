@@ -1,4 +1,4 @@
-import os
+import os 
 import re
 import discord
 from discord.ext import commands
@@ -105,7 +105,6 @@ class TranscriptView(discord.ui.View):
     def __init__(self, transcripts, player, offense, strike, sanction):
         super().__init__()
         self.add_item(TranscriptSelect(transcripts, player, offense, strike, sanction))
-
 
 # Punishment dictionary
 punishments = {
@@ -232,7 +231,6 @@ punishments = {
     }
 }
 
-
 class CustomPunishmentModal(discord.ui.Modal):
     def __init__(self, player: dict):
         super().__init__(title="Custom Punishment")
@@ -245,8 +243,15 @@ class CustomPunishmentModal(discord.ui.Modal):
     async def callback(self, interaction: discord.Interaction):
         reason_text = self.reason.value
         duration_text = self.duration.value
-        transcripts = await get_transcript_options(interaction.guild)
-        await interaction.response.send_message("Select a transcript:", view=TranscriptView(transcripts, self.player, reason_text, "Custom", duration_text), ephemeral=True)
+        # Directly send preview without requiring a transcript selection
+        response = (
+            f"Transcript link: [N/A]\n"
+            f"Player(s) being reported: {self.player['Name']}\n"
+            f"BUID: {self.player['BohemiaUID']}\n"
+            f"Verdict/Reason for ban: {reason_text}\n"
+            f"Ban Length: (Custom) {duration_text}"
+        )
+        await interaction.response.send_message(content=f"Preview:\n{response}", view=ConfirmationView(response), ephemeral=True)
 
 # Strike selection
 async def show_strike_menu(interaction: discord.Interaction, player: dict, offense: str):
@@ -286,7 +291,7 @@ async def show_strike_menu(interaction: discord.Interaction, player: dict, offen
                         if transcripts:
                             await interaction3.followup.send("Select a transcript:", view=TranscriptView(transcripts, player, offense, strike, chosen), ephemeral=True)
                         else:
-                            link = await get_latest_transcript(interaction3.guild)
+                            link = "N/A"
                             response = (
                                 f"Transcript link: {link}\n"
                                 f"Player(s) being reported: {player['Name']}\n"
@@ -337,13 +342,12 @@ async def show_offense_menu(interaction: discord.Interaction, player: dict):
             except:
                 pass
             offense = self.values[0]
-            await interaction2.response.defer(ephemeral=True)
             if offense == "Custom Punishment":
                 modal = CustomPunishmentModal(player)
                 await interaction2.response.send_modal(modal)
-            else:
-                await show_strike_menu(interaction2, player, offense)
-
+                return
+            await interaction2.response.defer(ephemeral=True)
+            await show_strike_menu(interaction2, player, offense)
 
     class OffenseView(discord.ui.View):
         def __init__(self):
