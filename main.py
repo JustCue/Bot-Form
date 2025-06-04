@@ -7,6 +7,8 @@ import asyncio
 from datetime import datetime
 from punishments import punishments
 from ban_history import ban_tracker
+import asyncpg
+from typing import List, Optional
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -15,13 +17,236 @@ tree = bot.tree
 # Store form state for back navigation
 user_form_state = {}
 
+class DatabaseConnection:
+    def __init__(self):
+        self.connection_string = os.getenv('DATABASE_CONNECTION_STRING')
+        self.pool = None
+    
+    async def initialize(self):
+        """Initialize the database connection pool"""
+        try:
+            self.pool = await asyncpg.create_pool(self.connection_string)
+            print("✅ Database connection established")
+        except Exception as e:
+            print(f"❌ Database connection failed: {e}")
+    
+    async def close(self):
+        """Close the database connection pool"""
+        if self.pool:
+            await self.pool.close()
+    
+    async def find_players(self, search_term: str) -> List[dict]:
+        """Find players by name (partial match)"""
+        if not self.pool:
+            return []
+        
+        query = """
+        SELECT pp."Name", pp."Level", pp."LastPlayed", pp."BohemiaUID"
+        FROM "PlayerProfiles" pp
+        WHERE LOWER(pp."Name") LIKE LOWER($1)
+        ORDER BY pp."LastPlayed" DESC
+        LIMIT 15
+        """
+        
+        try:
+            async with self.pool.acquire() as connection:
+                rows = await connection.fetch(query, f'%{search_term}%')
+                
+                players = []
+                for row in rows:
+                    # Calculate hours since last played
+                    if row['LastPlayed']:
+                        time_diff = datetime.utcnow() - row['LastPlayed']
+                        hours_since = int(time_diff.total_seconds() / 3600)
+                    else:
+                        hours_since = 0
+                    
+                    players.append({
+                        'Name': row['Name'],
+                        'Level': row['Level'],
+                        'Last Played': f"{hours_since}H",
+                        'BohemiaUID': str(row['BohemiaUID'])
+                    })
+                
+                return players
+        except Exception as e:
+            print(f"Database error: {e}")
+            return []
+
+# Initialize database connection
+db = DatabaseConnection()
+
+class PlayerSearchModal(discord.ui.Modal, title="Search for Player"):
+    search_term = discord.ui.TextInput(
+        label="Player Name",
+        style=discord.TextStyle.short,
+        placeholder="Enter player name or partial name...",
+        required=True,
+        min_length=2,
+        max_length=50
+    )
+
+    def __init__(self, from_buildbanform=False):
+        super().__init__()
+        self.from_buildbanform = from_buildbanform
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        
+        try:
+            # Search database first
+            players = await db.find_players(self.search_term.value)
+            
+            # If no database results, try channel search as fallback
+            if not players:
+                players = await search_channels_for_players(interaction.guild, self.search_term.value)
+            
+            if not players:
+                embed = discord.Embed(
+                    title="No Players Found",
+                    description=f"No players found matching '{self.search_term.value}'",
+                    color=discord.Color.red()
+                )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+            
+            # Store players in form state
+            user_form_state[interaction.user.id] = {'players': players}
+            
+            if self.from_buildbanform:
+                # For buildbanform, go directly to player selection
+                embed = discord.Embed(
+                    title="Build Ban Form - Select Player",
+                    description=f"Found {len(players)} player(s) matching '{self.search_term.value}'. Select a player to generate the ban form:",
+                    color=discord.Color.blue()
+                )
+                
+                # Show ALL results in preview - break into multiple fields if needed
+                preview_lines = []
+                for player in players:
+                    line = f"**{player['Name']}** (Level {player['Level']}, Last: {player['Last Played']})"
+                    preview_lines.append(line)
+                
+                # Split into multiple fields if too many players (Discord has field limits)
+                if len(preview_lines) <= 10:
+                    # If 10 or fewer, show in one field
+                    embed.add_field(
+                        name="Found Players",
+                        value="\n".join(preview_lines),
+                        inline=False
+                    )
+                else:
+                    # Split into multiple fields of 10 each
+                    for i in range(0, len(preview_lines), 10):
+                        chunk = preview_lines[i:i+10]
+                        field_num = (i // 10) + 1
+                        total_fields = (len(preview_lines) + 9) // 10
+                        
+                        embed.add_field(
+                            name=f"Found Players ({field_num}/{total_fields})",
+                            value="\n".join(chunk),
+                            inline=False
+                        )
+                
+                view = PlayerView(players)
+                await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            else:
+                # For ban_player, show detailed search results first
+                embed = discord.Embed(
+                    title="Ban Process - Step 1: Select Player",
+                    description=f"Found {len(players)} player(s) matching '{self.search_term.value}'. Please select the player you want to ban from the dropdown below.",
+                    color=discord.Color.orange()
+                )
+                
+                # Show ALL results in preview - break into multiple fields if needed
+                preview_lines = []
+                for player in players:
+                    line = f"**{player['Name']}** (Level {player['Level']}, Last: {player['Last Played']})"
+                    preview_lines.append(line)
+                
+                # Split into multiple fields if too many players
+                if len(preview_lines) <= 10:
+                    # If 10 or fewer, show in one field
+                    embed.add_field(
+                        name="Found Players",
+                        value="\n".join(preview_lines),
+                        inline=False
+                    )
+                else:
+                    # Split into multiple fields of 10 each
+                    for i in range(0, len(preview_lines), 10):
+                        chunk = preview_lines[i:i+10]
+                        field_num = (i // 10) + 1
+                        total_fields = (len(preview_lines) + 9) // 10
+                        
+                        embed.add_field(
+                            name=f"Found Players ({field_num}/{total_fields})",
+                            value="\n".join(chunk),
+                            inline=False
+                        )
+                
+                view = PlayerSearchView(players, self.search_term.value)
+                await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+                
+        except Exception as e:
+            embed = discord.Embed(
+                title="Search Error",
+                description=f"An error occurred while searching for players: {str(e)}",
+                color=discord.Color.red()
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+async def search_channels_for_players(guild: discord.Guild, search_term: str) -> list:
+    """Fallback method to search channels for player data"""
+    players = []
+    search_term_lower = search_term.lower()
+    
+    for channel in guild.text_channels:
+        try:
+            async for message in channel.history(limit=50):
+                if "Name = " in message.content:
+                    lines = message.content.replace(",", "\n").splitlines()
+                    for line in lines:
+                        parts = line.strip().split(" | ")
+                        player = {}
+                        for part in parts:
+                            if " = " in part:
+                                k, v = part.split(" = ", 1)
+                                player[k.strip()] = v.strip()
+                        
+                        # Check if this player matches our search and has all required fields
+                        if (all(k in player for k in ("Name", "Level", "Last Played", "BohemiaUID")) and 
+                            search_term_lower in player["Name"].lower()):
+                            # Avoid duplicates
+                            if not any(p["BohemiaUID"] == player["BohemiaUID"] for p in players):
+                                players.append(player)
+                    
+                # Limit results
+                if len(players) >= 15:
+                    break
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+        
+        if len(players) >= 15:
+            break
+    
+    return players
+
 @bot.event
 async def on_ready():
+    # Initialize database connection
+    await db.initialize()
+    
     try:
         await tree.sync()
         print(f"✅ Synced slash commands globally as {bot.user}")
     except Exception as e:
         print(f"❌ Failed to sync commands: {e}")
+
+@bot.event
+async def on_close():
+    """Clean up database connection when bot shuts down"""
+    await db.close()
 
 def generate_transcript_link(message: discord.Message, channel_name: str, *args) -> str:
     for attachment in message.attachments:
@@ -51,6 +276,128 @@ async def get_transcript_options(guild: discord.Guild, channel_name_contains="tr
         if len(transcripts) >= 5:
             break
     return transcripts
+
+class PlayerSearchView(discord.ui.View):
+    def __init__(self, players: List[dict], search_term: str):
+        super().__init__(timeout=300)  # 5 minute timeout
+        self.players = players
+        self.search_term = search_term
+        self.selected_player = None
+        
+        # Show detailed results first
+        show_results_button = discord.ui.Button(
+            label="📋 Show Detailed Results",
+            style=discord.ButtonStyle.primary
+        )
+        show_results_button.callback = self.show_detailed_results
+        self.add_item(show_results_button)
+        
+        # Create select menu with players
+        options = []
+        for i, player in enumerate(players[:25]):  # Discord limit of 25 options
+            label = f"{player['Name']} (Level {player['Level']})"
+            description = f"Last played: {player['Last Played']}"
+            
+            # Truncate if needed
+            if len(label) > 100:
+                label = label[:97] + "..."
+            if len(description) > 100:
+                description = description[:97] + "..."
+                
+            options.append(discord.SelectOption(
+                label=label,
+                description=description,
+                value=str(i)
+            ))
+        
+        if options:
+            self.player_select = discord.ui.Select(
+                placeholder="Select a player to proceed with ban...",
+                options=options
+            )
+            self.player_select.callback = self.player_selected
+            self.add_item(self.player_select)
+        
+        # Add search again button
+        search_again_button = discord.ui.Button(
+            label="🔍 Search Again",
+            style=discord.ButtonStyle.secondary
+        )
+        search_again_button.callback = self.search_again
+        self.add_item(search_again_button)
+    
+    async def show_detailed_results(self, interaction: discord.Interaction):
+        """Show the detailed search results in the requested format"""
+        # Create the formatted results as requested
+        result_lines = []
+        for player in self.players:
+            line = f"Name = {player['Name']} | Level = {player['Level']} | Last Played = {player['Last Played']} | BohemiaUID = {player['BohemiaUID']}"
+            result_lines.append(line)
+        
+        # Create embed with results
+        embed = discord.Embed(
+            title=f"Detailed Search Results for '{self.search_term}'",
+            description=f"Found {len(self.players)} player(s)",
+            color=discord.Color.blue()
+        )
+        
+        # Split results into chunks for Discord's limits
+        result_text = "\n".join(result_lines)
+        
+        # If the full text is short enough, show it all in description
+        if len(result_text) <= 4000:  # Leave some room for the title
+            embed.description = f"Found {len(self.players)} player(s)\n\n```\n{result_text}\n```"
+        else:
+            # Split into multiple fields if too long
+            chunks = [result_lines[i:i+8] for i in range(0, len(result_lines), 8)]  # 8 lines per field to stay under limits
+            for i, chunk in enumerate(chunks):
+                field_name = f"Results {i*8+1}-{min((i+1)*8, len(result_lines))}"
+                field_value = "```\n" + "\n".join(chunk) + "\n```"
+                embed.add_field(
+                    name=field_name,
+                    value=field_value,
+                    inline=False
+                )
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    
+    async def search_again(self, interaction: discord.Interaction):
+        """Allow user to search again"""
+        modal = PlayerSearchModal(from_buildbanform=False)
+        await interaction.response.send_modal(modal)
+    
+    async def player_selected(self, interaction: discord.Interaction):
+        """Called when a player is selected from the dropdown"""
+        selected_index = int(self.player_select.values[0])
+        self.selected_player = self.players[selected_index]
+        
+        try:
+            await interaction.message.delete()
+        except:
+            pass
+        
+        # Store players and selected player in form state
+        user_form_state[interaction.user.id] = {
+            'players': self.players,
+            'player': self.selected_player
+        }
+        
+        # Show selected player details and proceed to offense selection
+        embed = discord.Embed(
+            title="Player Selected for Ban",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Name", value=self.selected_player["Name"], inline=True)
+        embed.add_field(name="Level", value=self.selected_player["Level"], inline=True)
+        embed.add_field(name="Last Played", value=self.selected_player["Last Played"], inline=True)
+        embed.add_field(name="Bohemia UID", value=self.selected_player["BohemiaUID"], inline=False)
+        
+        # Proceed to offense selection
+        await interaction.response.send_message(
+            embed=embed,
+            view=OffenseView(self.selected_player), 
+            ephemeral=True
+        )
 
 class ConfirmationButton(discord.ui.Button):
     def __init__(self, response_text: str, player_data: dict, offense: str, strike: str, sanction: str, transcript: str, unban_data: dict = None):
@@ -577,11 +924,41 @@ class PlayerView(discord.ui.View):
         
         player_select = PlayerSelect(players)
         self.add_item(player_select)
+        
+        # Add a button to search for a different player
+        search_again_button = discord.ui.Button(
+            label="🔍 Search Again", 
+            style=discord.ButtonStyle.secondary
+        )
+        search_again_button.callback = self.search_again
+        self.add_item(search_again_button)
+    
+    async def search_again(self, interaction: discord.Interaction):
+        """Allow user to search for a different player"""
+        modal = PlayerSearchModal(from_buildbanform=True)
+        await interaction.response.send_modal(modal)
 
 class PlayerSelect(discord.ui.Select):
     def __init__(self, players: list):
         self.players = players
-        options = [discord.SelectOption(label=p["Name"], description=f"Level {p['Level']} - {p['Last Played']}") for p in players]
+        options = []
+        
+        for player in players[:25]:  # Discord limit of 25 options
+            label = player["Name"]
+            description = f"Level {player['Level']} - Last played {player['Last Played']}"
+            
+            # Truncate if too long for Discord limits
+            if len(label) > 100:
+                label = label[:97] + "..."
+            if len(description) > 100:
+                description = description[:97] + "..."
+                
+            options.append(discord.SelectOption(
+                label=label, 
+                description=description,
+                value=player["Name"]  # Use name as value since it should be unique in our search results
+            ))
+        
         super().__init__(placeholder="Choose a player...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
@@ -590,46 +967,48 @@ class PlayerSelect(discord.ui.Select):
         except:
             pass
         
+        # Find the selected player by name
         player = next(p for p in self.players if p["Name"] == self.values[0])
         
         # Update form state
         user_form_state[interaction.user.id]['player'] = player
         
-        await interaction.response.send_message("Select the offense:", view=OffenseView(player), ephemeral=True)
+        # Show selected player info
+        embed = discord.Embed(
+            title="Player Selected for Ban Form",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Name", value=player["Name"], inline=True)
+        embed.add_field(name="Level", value=player["Level"], inline=True)
+        embed.add_field(name="Last Played", value=player["Last Played"], inline=True)
+        embed.add_field(name="Bohemia UID", value=player["BohemiaUID"], inline=False)
+        
+        await interaction.response.send_message(
+            embed=embed,
+            view=OffenseView(player), 
+            ephemeral=True
+        )
 
-# Slash command: /buildbanform
-@tree.command(name="buildbanform", description="Build a formatted ban form from latest player info")
+# New player search command
+@tree.command(name="find_player", description="Search for a player in the database")
+async def find_player(interaction: discord.Interaction):
+    """Find players by name using a search modal"""
+    modal = PlayerSearchModal(from_buildbanform=False)
+    await interaction.response.send_modal(modal)
+
+# Updated ban_player command to use modal  
+@tree.command(name="ban_player", description="Start the ban process by searching for a player")
+async def ban_player(interaction: discord.Interaction):
+    """Start the ban process with player search"""
+    modal = PlayerSearchModal(from_buildbanform=False)
+    await interaction.response.send_modal(modal)
+
+# Updated buildbanform command to immediately show search modal
+@tree.command(name="buildbanform", description="Build a formatted ban form by searching for a player")
 async def buildbanform(interaction: discord.Interaction):
-    players = []
-    for channel in interaction.guild.text_channels:
-        try:
-            async for message in channel.history(limit=20):
-                if "Name = " in message.content:
-                    lines = message.content.replace(",", "\n").splitlines()
-                    for line in lines:
-                        parts = line.strip().split(" | ")
-                        player = {}
-                        for part in parts:
-                            if " = " in part:
-                                k, v = part.split(" = ", 1)
-                                player[k.strip()] = v.strip()
-                        if all(k in player for k in ("Name", "Level", "Last Played", "BohemiaUID")):
-                            players.append(player)
-                    if players:
-                        break
-        except (discord.Forbidden, discord.HTTPException):
-            continue
-        if players:
-            break
-
-    if not players:
-        await interaction.response.send_message("No valid player data found.", ephemeral=True)
-        return
-
-    # Store players in form state
-    user_form_state[interaction.user.id] = {'players': players}
-    
-    await interaction.response.send_message("Select a player to generate the ban form:", view=PlayerView(players), ephemeral=True)
+    """Build a formatted ban form - starts with player search"""
+    modal = PlayerSearchModal(from_buildbanform=True)
+    await interaction.response.send_modal(modal)
 
 # Ban history command
 @tree.command(name="banhistory", description="View ban history for a player")
@@ -673,4 +1052,8 @@ async def recentbans(interaction: discord.Interaction):
     await interaction.response.send_message(recent_text, ephemeral=True)
 
 # Run the bot
-bot.run(os.getenv("DISCORD_TOKEN"))
+if __name__ == "__main__":
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+    bot.run(os.getenv("DISCORD_TOKEN"))
