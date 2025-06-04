@@ -5,11 +5,15 @@ from discord.ext import commands
 from discord import app_commands
 import asyncio
 from datetime import datetime
-from punishments import punishments  # Import punishments from the separate file
+from punishments import punishments
+from ban_history import ban_tracker
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
+
+# Store form state for back navigation
+user_form_state = {}
 
 @bot.event
 async def on_ready():
@@ -22,7 +26,6 @@ async def on_ready():
 def generate_transcript_link(message: discord.Message, *args) -> str:
     for attachment in message.attachments:
         if attachment.filename.endswith(".html"):
-            # Match any numeric value in the filename, regardless of prefix
             match = re.search(r"(\d+)", attachment.filename)
             if match:
                 report_number = int(match.group(1))
@@ -45,22 +48,70 @@ async def get_transcript_options(guild: discord.Guild, channel_name_contains="tr
     return transcripts
 
 class ConfirmationButton(discord.ui.Button):
-    def __init__(self, response_text: str):
+    def __init__(self, response_text: str, player_data: dict, offense: str, strike: str, sanction: str, transcript: str, unban_data: dict = None):
         super().__init__(label="Confirm", style=discord.ButtonStyle.green)
         self.response_text = response_text
+        self.player_data = player_data
+        self.offense = offense
+        self.strike = strike
+        self.sanction = sanction
+        self.transcript = transcript
+        self.unban_data = unban_data
 
     async def callback(self, interaction: discord.Interaction):
         timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        
+        # Handle unban logic
+        if self.unban_data:
+            if self.unban_data['remove_strike']:
+                # Remove the strike from history
+                success = ban_tracker.remove_strike(self.unban_data['ban_id'])
+                if success:
+                    strike_note = f" (Strike removed from Ban #{self.unban_data['ban_id']:04d})"
+                else:
+                    strike_note = f" (Failed to remove strike from Ban #{self.unban_data['ban_id']:04d})"
+            else:
+                strike_note = f" (Strike remains from Ban #{self.unban_data['ban_id']:04d})"
+            
+            # Save unban record
+            ban_id = ban_tracker.add_ban(
+                player_name=self.player_data['Name'],
+                buid=self.player_data['BohemiaUID'],
+                offense=self.offense + strike_note,
+                strike="UNBAN",
+                sanction=self.sanction,
+                transcript=self.transcript,
+                submitted_by=str(interaction.user.id),
+                is_unban=True,
+                related_ban_id=self.unban_data['ban_id']
+            )
+        else:
+            # Regular ban
+            ban_id = ban_tracker.add_ban(
+                player_name=self.player_data['Name'],
+                buid=self.player_data['BohemiaUID'],
+                offense=self.offense,
+                strike=self.strike,
+                sanction=self.sanction,
+                transcript=self.transcript,
+                submitted_by=str(interaction.user.id)
+            )
+        
         final_response = (
             f"{self.response_text}\n"
             f"Submitted by: {interaction.user.mention}\n"
-            f"Time Submitted: {timestamp}"
+            f"Time Submitted: {timestamp}\n"
+            f"Ban ID: #{ban_id:04d}"
         )
-        # Delete the confirmation message
+        
         try:
             await interaction.message.delete()
         except:
             pass
+        
+        # Clear form state
+        if interaction.user.id in user_form_state:
+            del user_form_state[interaction.user.id]
         
         await interaction.response.send_message(final_response, ephemeral=False)
 
@@ -69,26 +120,213 @@ class CancelButton(discord.ui.Button):
         super().__init__(label="Cancel", style=discord.ButtonStyle.red)
 
     async def callback(self, interaction: discord.Interaction):
-        # Delete the confirmation message
         try:
             await interaction.message.delete()
         except:
             pass
         
+        # Clear form state
+        if interaction.user.id in user_form_state:
+            del user_form_state[interaction.user.id]
+        
         await interaction.response.send_message("❌ Ban form cancelled.", ephemeral=True)
 
-class ConfirmationView(discord.ui.View):
-    def __init__(self, response_text: str):
+class BackButton(discord.ui.Button):
+    def __init__(self, back_to: str):
+        super().__init__(label="← Back", style=discord.ButtonStyle.secondary)
+        self.back_to = back_to
+
+    async def callback(self, interaction: discord.Interaction):
+        user_id = interaction.user.id
+        if user_id not in user_form_state:
+            await interaction.response.send_message("❌ Form state lost. Please start over.", ephemeral=True)
+            return
+        
+        state = user_form_state[user_id]
+        
+        # Delete the current message and respond with new menu
+        try:
+            await interaction.message.delete()
+        except:
+            pass
+        
+        if self.back_to == "player":
+            await interaction.response.send_message("Select a player to generate the ban form:", view=PlayerView(state.get('players', [])), ephemeral=True)
+        elif self.back_to == "offense":
+            await interaction.response.send_message("Select the offense:", view=OffenseView(state['player']), ephemeral=True)
+        elif self.back_to == "strike":
+            await interaction.response.send_message("Select the strike level:", view=StrikeView(state['player'], state['offense']), ephemeral=True)
+
+class UnbanReportSelect(discord.ui.Select):
+    def __init__(self, player_buid: str, unban_type: str):
+        self.player_buid = player_buid
+        self.unban_type = unban_type
+        self.remove_strike = unban_type == "UNBAN (Remove Strike)"
+        
+        # Get player's ban history
+        history = ban_tracker.get_player_history(player_buid)
+        
+        options = []
+        if history:
+            # Only show bans that aren't unbans and have strikes to remove
+            for ban in history[-10:]:  # Last 10 bans
+                if not ban.get('is_unban', False):
+                    status = " ❌" if ban.get('strike_removed', False) else ""
+                    options.append(discord.SelectOption(
+                        label=f"Ban #{ban['id']:04d} - {ban['offense'][:50]}{status}",
+                        description=f"{ban['timestamp'][:10]} - ({ban['strike']}) {ban['sanction'][:50]}",
+                        value=str(ban['id'])
+                    ))
+        
+        if not options:
+            options.append(discord.SelectOption(label="No bans found for this player", value="none", description="Cannot proceed"))
+        
+        super().__init__(
+            placeholder=f"Select report to unban{'(remove strike)' if self.remove_strike else '(keep strike)'}...",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "none":
+            await interaction.response.send_message("❌ No valid bans found to unban.", ephemeral=True)
+            return
+        
+        try:
+            await interaction.message.delete()
+        except:
+            pass
+        
+        ban_id = int(self.values[0])
+        user_id = interaction.user.id
+        state = user_form_state[user_id]
+        
+        # Store unban data
+        unban_data = {
+            'ban_id': ban_id,
+            'remove_strike': self.remove_strike
+        }
+        
+        # Get transcripts and proceed
+        transcripts = await get_transcript_options(interaction.guild)
+        if transcripts:
+            await interaction.response.send_message(
+                "Select a transcript:", 
+                view=TranscriptView(transcripts, state['player'], self.unban_type, "UNBAN", "Player Unbanned", unban_data), 
+                ephemeral=True
+            )
+        else:
+            response = (
+                f"Transcript link: N/A\n"
+                f"Player(s) being reported: {state['player']['Name']}\n"
+                f"BUID: {state['player']['BohemiaUID']}\n"
+                f"Verdict/Reason for ban: {self.unban_type}\n"
+                f"Ban Length: (UNBAN) Player Unbanned\n"
+                f"Related to Ban #{ban_id:04d}"
+            )
+            await interaction.response.send_message(
+                content=f"Preview:\n{response}", 
+                view=ConfirmationView(response, state['player'], self.unban_type, "UNBAN", "Player Unbanned", "N/A", unban_data), 
+                ephemeral=True
+            )
+
+class UnbanReportView(discord.ui.View):
+    def __init__(self, player_buid: str, unban_type: str):
         super().__init__()
-        self.add_item(ConfirmationButton(response_text))
+        self.add_item(UnbanReportSelect(player_buid, unban_type))
+        self.add_item(BackButton("offense"))
+
+class TranscriptBackButton(discord.ui.Button):
+    def __init__(self, player: dict, offense: str, strike: str, sanction: str, unban_data: dict = None):
+        super().__init__(label="← Back", style=discord.ButtonStyle.secondary)
+        self.player = player
+        self.offense = offense
+        self.strike = strike
+        self.sanction = sanction
+        self.unban_data = unban_data
+
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            await interaction.message.delete()
+        except:
+            pass
+        
+        # Update form state to include current selections
+        user_form_state[interaction.user.id] = {
+            'player': self.player,
+            'offense': self.offense,
+            'strike': self.strike,
+            'players': user_form_state.get(interaction.user.id, {}).get('players', [])
+        }
+        
+        # Handle unban back navigation
+        if self.unban_data:
+            await interaction.response.send_message(
+                "Select which report to unban:", 
+                view=UnbanReportView(self.player['BohemiaUID'], self.offense), 
+                ephemeral=True
+            )
+            return
+        
+        # Check if we need to go back to sanction selection or strike selection
+        sanctions = punishments[self.offense][self.strike]
+        
+        if isinstance(sanctions, list):
+            # Go back to sanction selection
+            class BackSanctionSelect(discord.ui.Select):
+                def __init__(self):
+                    super().__init__(
+                        placeholder="Select ban duration...",
+                        min_values=1,
+                        max_values=1,
+                        options=[discord.SelectOption(label=d) for d in sanctions]
+                    )
+
+                async def callback(self3, interaction3: discord.Interaction):
+                    try:
+                        await interaction3.message.delete()
+                    except:
+                        pass
+                    
+                    chosen = self3.values[0]
+                    transcripts = await get_transcript_options(interaction3.guild)
+                    if transcripts:
+                        await interaction3.response.send_message("Select a transcript:", view=TranscriptView(transcripts, self.player, self.offense, self.strike, chosen), ephemeral=True)
+                    else:
+                        response = (
+                            f"Transcript link: N/A\n"
+                            f"Player(s) being reported: {self.player['Name']}\n"
+                            f"BUID: {self.player['BohemiaUID']}\n"
+                            f"Verdict/Reason for ban: {self.offense}\n"
+                            f"Ban Length: ({self.strike}) {chosen}"
+                        )
+                        await interaction3.response.send_message(content=f"Preview:\n{response}", view=ConfirmationView(response, self.player, self.offense, self.strike, chosen, "N/A"), ephemeral=True)
+
+            class BackSanctionView(discord.ui.View):
+                def __init__(self):
+                    super().__init__()
+                    self.add_item(BackSanctionSelect())
+                    self.add_item(BackButton("strike"))
+
+            await interaction.response.send_message("Select a ban duration:", view=BackSanctionView(), ephemeral=True)
+        else:
+            # Go back directly to strike selection
+            await interaction.response.send_message("Select the strike level:", view=StrikeView(self.player, self.offense), ephemeral=True)
+
+class ConfirmationView(discord.ui.View):
+    def __init__(self, response_text: str, player_data: dict, offense: str, strike: str, sanction: str, transcript: str, unban_data: dict = None):
+        super().__init__()
+        self.add_item(ConfirmationButton(response_text, player_data, offense, strike, sanction, transcript, unban_data))
+        self.add_item(BackButton("strike"))
         self.add_item(CancelButton())
 
 class TranscriptSelect(discord.ui.Select):
-    def __init__(self, transcripts: list[str], player: dict, offense: str, strike: str, sanction: str):
+    def __init__(self, transcripts: list[str], player: dict, offense: str, strike: str, sanction: str, unban_data: dict = None):
         self.transcript_map = {}
+        self.unban_data = unban_data
         options = []
 
-        # Add the "Will add later" and "Witness" options first
         options.append(discord.SelectOption(label="Will add later", value="add_later"))
         options.append(discord.SelectOption(label="Witness", value="witness"))
 
@@ -107,7 +345,6 @@ class TranscriptSelect(discord.ui.Select):
         self.sanction = sanction
 
     async def callback(self, interaction: discord.Interaction):
-        # Delete the transcript selection message
         try:
             await interaction.message.delete()
         except discord.HTTPException:
@@ -123,19 +360,36 @@ class TranscriptSelect(discord.ui.Select):
             label = self.transcript_map.get(chosen_value, "Transcript")
             link = f"[{label}](<{chosen_value}>)"
 
+        # Check for previous bans (skip for unbans)
+        history_note = ""
+        if not self.unban_data:
+            previous_strikes = ban_tracker.get_player_strikes(self.player['BohemiaUID'])
+            if previous_strikes > 0:
+                history_note = f"\n⚠️ **Previous Strikes:** {previous_strikes}"
+
         response = (
             f"Transcript link: {link}\n"
             f"Player(s) being reported: {self.player['Name']}\n"
             f"BUID: {self.player['BohemiaUID']}\n"
             f"Verdict/Reason for ban: {self.offense}\n"
-            f"Ban Length: ({self.strike}) {self.sanction}"
+            f"Ban Length: ({self.strike}) {self.sanction}{history_note}"
         )
-        await interaction.response.send_message(content=f"Preview:\n{response}", view=ConfirmationView(response), ephemeral=True)
+        
+        if self.unban_data:
+            response += f"\nRelated to Ban #{self.unban_data['ban_id']:04d}"
+        
+        await interaction.response.send_message(
+            content=f"Preview:\n{response}", 
+            view=ConfirmationView(response, self.player, self.offense, self.strike, self.sanction, link, self.unban_data), 
+            ephemeral=True
+        )
 
 class TranscriptView(discord.ui.View):
-    def __init__(self, transcripts, player, offense, strike, sanction):
+    def __init__(self, transcripts, player, offense, strike, sanction, unban_data: dict = None):
         super().__init__()
-        self.add_item(TranscriptSelect(transcripts, player, offense, strike, sanction))
+        self.add_item(TranscriptSelect(transcripts, player, offense, strike, sanction, unban_data))
+        # Add back button to transcript selection
+        self.add_item(TranscriptBackButton(player, offense, strike, sanction, unban_data))
 
 class CustomPunishmentModal(discord.ui.Modal, title="Custom Punishment Entry"):
     reason = discord.ui.TextInput(
@@ -155,12 +409,10 @@ class CustomPunishmentModal(discord.ui.Modal, title="Custom Punishment Entry"):
         self.player = player
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Get transcripts for custom punishment
         transcripts = await get_transcript_options(interaction.guild)
         if transcripts:
             await interaction.response.send_message("Select a transcript:", view=TranscriptView(transcripts, self.player, self.reason.value, "Custom", self.length.value), ephemeral=True)
         else:
-            # If no transcripts available, provide default preview
             response = (
                 f"Transcript link: N/A\n"
                 f"Player(s) being reported: {self.player['Name']}\n"
@@ -170,114 +422,164 @@ class CustomPunishmentModal(discord.ui.Modal, title="Custom Punishment Entry"):
             )
             await interaction.response.send_message(
                 content=f"Preview:\n{response}",
-                view=ConfirmationView(response),
+                view=ConfirmationView(response, self.player, self.reason.value, "Custom", self.length.value, "N/A"),
                 ephemeral=True
             )
 
-# Strike selection
-async def show_strike_menu(interaction: discord.Interaction, player: dict, offense: str):
-    class StrikeSelect(discord.ui.Select):
-        def __init__(self):
-            self.strikes = punishments[offense]
-            options = [discord.SelectOption(label=s) for s in self.strikes.keys()]
-            super().__init__(placeholder="Select strike level...", min_values=1, max_values=1, options=options)
+# Updated View classes to be standalone
+class StrikeView(discord.ui.View):
+    def __init__(self, player: dict, offense: str):
+        super().__init__()
+        self.player = player
+        self.offense = offense
+        
+        # Handle unban types differently
+        if offense in ["UNBAN (Strike Remains)", "UNBAN (Remove Strike)"]:
+            # For unbans, skip strike selection and go to report selection
+            pass
+        else:
+            # Store state
+            strikes = punishments[offense]
+            strike_select = StrikeSelect(player, offense, strikes)
+            self.add_item(strike_select)
+        
+        self.add_item(BackButton("offense"))
 
-        async def callback(self, interaction2: discord.Interaction):
-            # Delete the strike selection message
-            try:
-                await interaction2.message.delete()
-            except:
-                pass
-            
-            strike = self.values[0]
-            sanctions = self.strikes[strike]
+class StrikeSelect(discord.ui.Select):
+    def __init__(self, player: dict, offense: str, strikes: dict):
+        self.player = player
+        self.offense = offense
+        self.strikes = strikes
+        options = [discord.SelectOption(label=s) for s in strikes.keys()]
+        super().__init__(placeholder="Select strike level...", min_values=1, max_values=1, options=options)
 
-            if isinstance(sanctions, list):
-                class SanctionSelect(discord.ui.Select):
-                    def __init__(self):
-                        super().__init__(
-                            placeholder="Select ban duration...",
-                            min_values=1,
-                            max_values=1,
-                            options=[discord.SelectOption(label=d) for d in sanctions]
-                        )
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            await interaction.message.delete()
+        except:
+            pass
+        
+        strike = self.values[0]
+        sanctions = self.strikes[strike]
 
-                    async def callback(self3, interaction3: discord.Interaction):
-                        # Delete the sanction selection message
-                        try:
-                            await interaction3.message.delete()
-                        except:
-                            pass
-                        
-                        chosen = self3.values[0]
-                        transcripts = await get_transcript_options(interaction3.guild)
-                        if transcripts:
-                            await interaction3.response.send_message("Select a transcript:", view=TranscriptView(transcripts, player, offense, strike, chosen), ephemeral=True)
-                        else:
-                            response = (
-                                f"Transcript link: N/A\n"
-                                f"Player(s) being reported: {player['Name']}\n"
-                                f"BUID: {player['BohemiaUID']}\n"
-                                f"Verdict/Reason for ban: {offense}\n"
-                                f"Ban Length: ({strike}) {chosen}"
-                            )
-                            await interaction3.response.send_message(content=f"Preview:\n{response}", view=ConfirmationView(response), ephemeral=True)
-
-                class SanctionView(discord.ui.View):
-                    def __init__(self):
-                        super().__init__()
-                        self.add_item(SanctionSelect())
-
-                await interaction2.response.send_message("Select a ban duration:", view=SanctionView(), ephemeral=True)
-            else:
-                transcripts = await get_transcript_options(interaction2.guild)
-                if transcripts:
-                    await interaction2.response.send_message("Select a transcript:", view=TranscriptView(transcripts, player, offense, strike, sanctions), ephemeral=True)
-                else:
-                    response = (
-                        f"Transcript link: N/A\n"
-                        f"Player(s) being reported: {player['Name']}\n"
-                        f"BUID: {player['BohemiaUID']}\n"
-                        f"Verdict/Reason for ban: {offense}\n"
-                        f"Ban Length: ({strike}) {sanctions}"
+        if isinstance(sanctions, list):
+            class SanctionSelect(discord.ui.Select):
+                def __init__(self):
+                    super().__init__(
+                        placeholder="Select ban duration...",
+                        min_values=1,
+                        max_values=1,
+                        options=[discord.SelectOption(label=d) for d in sanctions]
                     )
-                    await interaction2.response.send_message(content=f"Preview:\n{response}", view=ConfirmationView(response), ephemeral=True)
 
-    class StrikeView(discord.ui.View):
-        def __init__(self):
-            super().__init__()
-            self.add_item(StrikeSelect())
+                async def callback(self3, interaction3: discord.Interaction):
+                    try:
+                        await interaction3.message.delete()
+                    except:
+                        pass
+                    
+                    chosen = self3.values[0]
+                    transcripts = await get_transcript_options(interaction3.guild)
+                    if transcripts:
+                        await interaction3.response.send_message("Select a transcript:", view=TranscriptView(transcripts, self.player, self.offense, strike, chosen), ephemeral=True)
+                    else:
+                        response = (
+                            f"Transcript link: N/A\n"
+                            f"Player(s) being reported: {self.player['Name']}\n"
+                            f"BUID: {self.player['BohemiaUID']}\n"
+                            f"Verdict/Reason for ban: {self.offense}\n"
+                            f"Ban Length: ({strike}) {chosen}"
+                        )
+                        await interaction3.response.send_message(content=f"Preview:\n{response}", view=ConfirmationView(response, self.player, self.offense, strike, chosen, "N/A"), ephemeral=True)
 
-    await interaction.followup.send("Select the strike level:", view=StrikeView(), ephemeral=True)
+            class SanctionView(discord.ui.View):
+                def __init__(self):
+                    super().__init__()
+                    self.add_item(SanctionSelect())
 
-# Offense selection
-async def show_offense_menu(interaction: discord.Interaction, player: dict):
-    class OffenseSelect(discord.ui.Select):
-        def __init__(self):
-            options = [discord.SelectOption(label=o) for o in punishments.keys()]
-            super().__init__(placeholder="Select offense...", min_values=1, max_values=1, options=options)
+            await interaction.response.send_message("Select a ban duration:", view=SanctionView(), ephemeral=True)
+        else:
+            transcripts = await get_transcript_options(interaction.guild)
+            if transcripts:
+                await interaction.response.send_message("Select a transcript:", view=TranscriptView(transcripts, self.player, self.offense, strike, sanctions), ephemeral=True)
+            else:
+                response = (
+                    f"Transcript link: N/A\n"
+                    f"Player(s) being reported: {self.player['Name']}\n"
+                    f"BUID: {self.player['BohemiaUID']}\n"
+                    f"Verdict/Reason for ban: {self.offense}\n"
+                    f"Ban Length: ({strike}) {sanctions}"
+                )
+                await interaction.response.send_message(content=f"Preview:\n{response}", view=ConfirmationView(response, self.player, self.offense, strike, sanctions, "N/A"), ephemeral=True)
 
-        async def callback(self, interaction2: discord.Interaction):
-            # Delete the offense selection message
-            try:
-                await interaction2.message.delete()
-            except:
-                pass
-            
-            offense = self.values[0]
-            if offense == "Custom Punishment":
-                await interaction2.response.send_modal(CustomPunishmentModal(player))
-                return
-            
-            await interaction2.response.defer(ephemeral=True)
-            await show_strike_menu(interaction2, player, offense)
+class OffenseView(discord.ui.View):
+    def __init__(self, player: dict):
+        super().__init__()
+        self.player = player
+        
+        offense_select = OffenseSelect(player)
+        self.add_item(offense_select)
+        self.add_item(BackButton("player"))
 
-    class OffenseView(discord.ui.View):
-        def __init__(self):
-            super().__init__()
-            self.add_item(OffenseSelect())
+class OffenseSelect(discord.ui.Select):
+    def __init__(self, player: dict):
+        self.player = player
+        # Add unban options to the punishment list
+        all_offenses = list(punishments.keys()) + ["UNBAN (Strike Remains)", "UNBAN (Remove Strike)"]
+        options = [discord.SelectOption(label=o) for o in all_offenses]
+        super().__init__(placeholder="Select offense...", min_values=1, max_values=1, options=options)
 
-    await interaction.followup.send("Select the offense:", view=OffenseView(), ephemeral=True)
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            await interaction.message.delete()
+        except:
+            pass
+        
+        offense = self.values[0]
+        
+        # Update form state
+        user_form_state[interaction.user.id]['offense'] = offense
+        
+        if offense == "Custom Punishment":
+            await interaction.response.send_modal(CustomPunishmentModal(self.player))
+            return
+        elif offense in ["UNBAN (Strike Remains)", "UNBAN (Remove Strike)"]:
+            # Go directly to report selection for unbans
+            await interaction.response.send_message(
+                "Select which report to unban:", 
+                view=UnbanReportView(self.player['BohemiaUID'], offense), 
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.send_message("Select the strike level:", view=StrikeView(self.player, offense), ephemeral=True)
+
+class PlayerView(discord.ui.View):
+    def __init__(self, players: list):
+        super().__init__()
+        self.players = players
+        
+        player_select = PlayerSelect(players)
+        self.add_item(player_select)
+
+class PlayerSelect(discord.ui.Select):
+    def __init__(self, players: list):
+        self.players = players
+        options = [discord.SelectOption(label=p["Name"], description=f"Level {p['Level']} - {p['Last Played']}") for p in players]
+        super().__init__(placeholder="Choose a player...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            await interaction.message.delete()
+        except:
+            pass
+        
+        player = next(p for p in self.players if p["Name"] == self.values[0])
+        
+        # Update form state
+        user_form_state[interaction.user.id]['player'] = player
+        
+        await interaction.response.send_message("Select the offense:", view=OffenseView(player), ephemeral=True)
 
 # Slash command: /buildbanform
 @tree.command(name="buildbanform", description="Build a formatted ban form from latest player info")
@@ -308,28 +610,51 @@ async def buildbanform(interaction: discord.Interaction):
         await interaction.response.send_message("No valid player data found.", ephemeral=True)
         return
 
-    class PlayerSelect(discord.ui.Select):
-        def __init__(self):
-            options = [discord.SelectOption(label=p["Name"], description=f"Level {p['Level']} - {p['Last Played']}") for p in players]
-            super().__init__(placeholder="Choose a player...", min_values=1, max_values=1, options=options)
+    # Store players in form state
+    user_form_state[interaction.user.id] = {'players': players}
+    
+    await interaction.response.send_message("Select a player to generate the ban form:", view=PlayerView(players), ephemeral=True)
 
-        async def callback(self, interaction2: discord.Interaction):
-            # Delete the player selection message
-            try:
-                await interaction2.message.delete()
-            except:
-                pass
-            
-            await interaction2.response.defer(ephemeral=True)
-            player = next(p for p in players if p["Name"] == self.values[0])
-            await show_offense_menu(interaction2, player)
+# Ban history command
+@tree.command(name="banhistory", description="View ban history for a player")
+async def banhistory(interaction: discord.Interaction, buid: str):
+    history = ban_tracker.get_player_history(buid)
+    
+    if not history:
+        await interaction.response.send_message(f"No ban history found for BUID: {buid}", ephemeral=True)
+        return
+    
+    history_text = f"**Ban History for BUID: {buid}**\n\n"
+    
+    for ban in history[-10:]:  # Last 10 bans
+        unban_marker = "🔓 " if ban.get('is_unban', False) else ""
+        strike_marker = " ❌" if ban.get('strike_removed', False) else ""
+        
+        history_text += f"**{unban_marker}Ban #{ban['id']:04d}** - {ban['timestamp'][:10]}{strike_marker}\n"
+        history_text += f"Player: {ban['player_name']}\n"
+        history_text += f"Offense: {ban['offense']}\n"
+        history_text += f"Punishment: ({ban['strike']}) {ban['sanction']}\n\n"
+    
+    await interaction.response.send_message(history_text, ephemeral=True)
 
-    class PlayerView(discord.ui.View):
-        def __init__(self):
-            super().__init__()
-            self.add_item(PlayerSelect())
-
-    await interaction.response.send_message("Select a player to generate the ban form:", view=PlayerView(), ephemeral=True)
+# Recent bans command
+@tree.command(name="recentbans", description="View recent ban submissions")
+async def recentbans(interaction: discord.Interaction):
+    recent = ban_tracker.get_recent_bans(10)
+    
+    if not recent:
+        await interaction.response.send_message("No recent bans found.", ephemeral=True)
+        return
+    
+    recent_text = "**Recent Ban Submissions:**\n\n"
+    
+    for ban in recent:
+        unban_marker = "🔓 " if ban.get('is_unban', False) else ""
+        recent_text += f"**{unban_marker}#{ban['id']:04d}** - {ban['player_name']} ({ban['offense']})\n"
+        recent_text += f"Punishment: ({ban['strike']}) {ban['sanction']}\n"
+        recent_text += f"Date: {ban['timestamp'][:10]}\n\n"
+    
+    await interaction.response.send_message(recent_text, ephemeral=True)
 
 # Run the bot
 bot.run(os.getenv("DISCORD_TOKEN"))
