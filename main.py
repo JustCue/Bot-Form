@@ -1,17 +1,15 @@
-import os
+import os 
 import re
-import discord # Make sure this is here
+import discord
 from discord.ext import commands
 from discord import app_commands
 import asyncio
 from datetime import datetime
-
-
+from punishments import punishments  # Import punishments from the separate file
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
-
 
 @bot.event
 async def on_ready():
@@ -20,12 +18,6 @@ async def on_ready():
         print(f"✅ Synced slash commands globally as {bot.user}")
     except Exception as e:
         print(f"❌ Failed to sync commands: {e}")
-    try:
-        await tree.sync()
-        print(f"✅ Synced slash commands globally as {bot.user}")
-    except Exception as e:
-        print(f"❌ Failed to sync commands: {e}")
-
 
 def generate_transcript_link(message: discord.Message, *args) -> str:
     for attachment in message.attachments:
@@ -37,29 +29,20 @@ def generate_transcript_link(message: discord.Message, *args) -> str:
                 return f"[Report-{report_number:04d}](<{message.jump_url}>)"
     return f"[Transcript](<{message.jump_url}>)"
 
-
-async def get_transcript_options(
-    guild: discord.Guild, channel_name_contains="transcript"
-) -> list[str]:
-    transcript_channel = next(
-        (c for c in guild.text_channels if channel_name_contains in c.name.lower()),
-        None,
-    )
+async def get_transcript_options(guild: discord.Guild, channel_name_contains="transcript") -> list[str]:
+    transcript_channel = next((c for c in guild.text_channels if channel_name_contains in c.name.lower()), None)
     if not transcript_channel:
         return []
-
     transcripts = []
     index = 1
     async for message in transcript_channel.history(limit=50):
-        if message.attachments and any(
-            att.filename.endswith(".html") for att in message.attachments
-        ):
-            transcripts.append(generate_transcript_link(message, index))
-            index += 1
+        if message.attachments:
+            if any(att.filename.endswith(".html") for att in message.attachments):
+                transcripts.append(generate_transcript_link(message, index))
+                index += 1
         if len(transcripts) >= 5:
             break
     return transcripts
-
 
 class ConfirmationButton(discord.ui.Button):
     def __init__(self, response_text: str):
@@ -73,65 +56,72 @@ class ConfirmationButton(discord.ui.Button):
             f"Submitted by: {interaction.user.mention}\n"
             f"Time Submitted: {timestamp}"
         )
-        await interaction.response.defer(thinking=False)
+        # Delete the confirmation message
         try:
-            await interaction.edit_original_response(content="✔️ Submitted.", view=None)
-        except discord.NotFound: # Be more specific with exceptions if possible
+            await interaction.message.delete()
+        except:
             pass
-        except Exception as e:
-            print(f"Error editing original response: {e}") # Optional: log other errors
-            pass 
-        await interaction.followup.send(final_response, ephemeral=False)
+        
+        await interaction.response.send_message(final_response, ephemeral=False)
 
+class CancelButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Cancel", style=discord.ButtonStyle.red)
+
+    async def callback(self, interaction: discord.Interaction):
+        # Delete the confirmation message
+        try:
+            await interaction.message.delete()
+        except:
+            pass
+        
+        await interaction.response.send_message("❌ Ban form cancelled.", ephemeral=True)
 
 class ConfirmationView(discord.ui.View):
     def __init__(self, response_text: str):
         super().__init__()
         self.add_item(ConfirmationButton(response_text))
-
+        self.add_item(CancelButton())
 
 class TranscriptSelect(discord.ui.Select):
-    def __init__(
-        self,
-        transcripts: list[str],
-        player: dict,
-        offense: str,
-        strike: str,
-        sanction: str,
-    ):
+    def __init__(self, transcripts: list[str], player: dict, offense: str, strike: str, sanction: str):
         self.transcript_map = {}
         options = []
+
+        # Add the "Will add later" and "Witness" options first
+        options.append(discord.SelectOption(label="Will add later", value="add_later"))
+        options.append(discord.SelectOption(label="Witness", value="witness"))
+
         for link in transcripts:
             match = re.match(r"\[(.*?)\]\(<(.*?)>\)", link)
             if match:
                 label, url = match.groups()
-                self.transcript_map[url] = label
-                options.append(discord.SelectOption(label=label, value=url))
+                if url not in self.transcript_map:
+                    self.transcript_map[url] = label
+                    options.append(discord.SelectOption(label=label, value=url))
 
-        super().__init__(
-            placeholder="Select a transcript...",
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
+        super().__init__(placeholder="Select a transcript or option...", min_values=1, max_values=1, options=options)
         self.player = player
         self.offense = offense
         self.strike = strike
         self.sanction = sanction
 
     async def callback(self, interaction: discord.Interaction):
+        # Delete the transcript selection message
         try:
             await interaction.message.delete()
-        except discord.NotFound:
-            pass
-        except Exception as e:
-            print(f"Error deleting message: {e}")
+        except discord.HTTPException:
             pass
 
-        await interaction.response.defer(ephemeral=True)
-        chosen_url = self.values[0]
-        label = self.transcript_map.get(chosen_url, "Transcript")
-        link = f"[{label}](<{chosen_url}>)"
+        chosen_value = self.values[0]
+
+        if chosen_value == "add_later":
+            link = "Will add later"
+        elif chosen_value == "witness":
+            link = "Witness"
+        else:
+            label = self.transcript_map.get(chosen_value, "Transcript")
+            link = f"[{label}](<{chosen_value}>)"
 
         response = (
             f"Transcript link: {link}\n"
@@ -140,343 +130,146 @@ class TranscriptSelect(discord.ui.Select):
             f"Verdict/Reason for ban: {self.offense}\n"
             f"Ban Length: ({self.strike}) {self.sanction}"
         )
-        await interaction.followup.send(
-            content=f"Preview:\n{response}",
-            view=ConfirmationView(response),
-            ephemeral=True,
-        )
-
+        await interaction.response.send_message(content=f"Preview:\n{response}", view=ConfirmationView(response), ephemeral=True)
 
 class TranscriptView(discord.ui.View):
     def __init__(self, transcripts, player, offense, strike, sanction):
         super().__init__()
         self.add_item(TranscriptSelect(transcripts, player, offense, strike, sanction))
 
+class CustomPunishmentModal(discord.ui.Modal, title="Custom Punishment Entry"):
+    reason = discord.ui.TextInput(
+        label="Reason",
+        style=discord.TextStyle.long,
+        placeholder="Enter custom reason...",
+        required=True
+    )
+    length = discord.ui.TextInput(
+        label="Ban Length",
+        placeholder="Enter ban length (e.g., 3 days)",
+        required=True
+    )
 
-# Punishment dictionary
-punishments = {
-    "Custom Punishment": {},
-    "Spamming": {
-        "Strike 1": "30‑Min /timeout",
-        "Strike 2": "1 Day Ban",
-        "Strike 3": "1 Month Ban",
-        "Strike 4": "Permanent Ban",
-    },
-    "Prohibited Messages & Links": {
-        "Strike 1": "1 Hour /timeout",
-        "Strike 2": "24 Hour /timeout",
-        "Strike 3": "7 Day Ban",
-        "Strike 4": "Permanent Ban",
-    },
-    "Advertising": {
-        "Strike 1": "3 Hour /timeout",
-        "Strike 2": "24 Hour /timeout",
-        "Strike 3": "7 Day Ban",
-        "Strike 4": "Permanent Ban",
-    },
-    "Staff Disrespect": {
-        "Strike 1": "4 Hour /timeout",
-        "Strike 2": "25 Hour /timeout",
-        "Strike 3": "7 Day Ban",
-        "Strike 4": "Permanent Ban",
-    },
-    "Team Killing": {
-        "Strike 1": ["3 Day Ban", "4 Day Ban", "5 Day Ban", "6 Day Ban", "7 Day Ban"],
-        "Strike 2": "1 Month Ban",
-        "Strike 3": "1 Year Ban",
-        "Strike 4": "Permanent Ban",
-    },
-    "In‑Game": {
-        "Strike 1": "Warning",
-        "Strike 2": "Strike 2",
-        "Strike 3": "Strike 3",
-        "Strike 4": "Strike 4",
-    },
-    "Prohibited Messages & Links (Severe)": {
-        "Strike 1": "3 Month Ban",
-        "Strike 2": "1 Year Ban",
-        "Strike 3": "Permanent Ban",
-        "Strike 4": "Permanent Ban",
-    },
-    "Prohibited Messages & Links (Minor)": {
-        "Strike 1": "1 Week Ban",
-        "Strike 2": "1 Month Ban",
-        "Strike 3": "1 Year Ban",
-        "Strike 4": "Permanent Ban",
-    },
-    "Exploiting": {
-        "Strike 1": "3 Month Ban",
-        "Strike 2": "6‑12 Month Ban",
-        "Strike 3": "1‑2 Year Ban",
-        "Strike 4": "Permanent Ban",
-    },
-    "Cheating": {
-        "Strike 1": "Permanent Ban",
-        "Strike 2": "Permanent Ban",
-        "Strike 3": "Permanent Ban",
-        "Strike 4": "Permanent Ban",
-    },
-    "Damaging Team Vehicles": {
-        "Strike 1": "3 Day Ban",
-        "Strike 2": "1 Month Ban",
-        "Strike 3": "1 Year Ban",
-        "Strike 4": "Permanent Ban",
-    },
-    "Air to Air Ramming / Air to Enemy": {
-        "Strike 1": "3 Day Ban",
-        "Strike 2": "1 Month Ban",
-        "Strike 3": "1 Year Ban",
-        "Strike 4": "Permanent Ban",
-    },
-    "Trolling / Griefing / Minging": {
-        "Strike 1": "7 Day Ban",
-        "Strike 2": "1 Month Ban",
-        "Strike 3": "1 Year Ban",
-        "Strike 4": "Permanent Ban",
-    },
-    "Spawncamping with LOS": {
-        "Strike 1": "Warning",
-        "Strike 2": "1 Month Ban",
-        "Strike 3": "1 Year Ban",
-        "Strike 4": "Permanent Ban",
-    },
-    "Spawncamping without LOS": {
-        "Strike 1": "Warning",
-        "Strike 2": "1 Month Ban",
-        "Strike 3": "1 Year Ban",
-        "Strike 4": "Permanent Ban",
-    },
-    "Abusing spawnprotection": {
-        "Strike 1": "Warning",
-        "Strike 2": "1 Month Ban",
-        "Strike 3": "1 Year Ban",
-        "Strike 4": "Permanent Ban",
-    },
-    "Stream‑Sniping": {
-        "Strike 1": "Warning",
-        "Strike 2": "3 Week Ban",
-        "Strike 3": "3 Month Ban",
-        "Strike 4": "Permanent Ban",
-    },
-    "Ghosting": {
-        "Strike 1": "Warning",
-        "Strike 2": "3 Week Ban",
-        "Strike 3": "3 Month Ban",
-        "Strike 4": "Permanent Ban",
-    },
-    "Going AFK": {
-        "Strike 1": "Warning",
-        "Strike 2": "Kick from Server",
-        "Strike 3": "Kick from Server",
-        "Strike 4": "Kick from Server",
-    },
-    "Ban Evading": {
-        "Strike 1": "Warning",
-        "Strike 2": "Permanent Ban",
-        "Strike 3": "Permanent Ban",
-        "Strike 4": "Permanent Ban",
-    },
-}
+    def __init__(self, player: dict):
+        super().__init__()
+        self.player = player
 
-
-class CustomPunishmentModal(discord.ui.Modal):
-    def __init__(self, player: dict): # player is still passed
-        super().__init__(title="Custom Punishment")
-        # self.player = player # Still commented out for this test
-        print(f"✅ CustomPunishmentModal.__init__ called. (self.player is temporarily disabled for testing minimal callback). Player data received: {player}")
-
-        self.reason = discord.ui.TextInput(
-            label="Reason (Test)",  # <--- SHORTENED (13 chars)
-            placeholder="Enter ban reason",
-            style=discord.TextStyle.short,
-        )
-        self.duration = discord.ui.TextInput(
-            label="Duration (Test)", # <--- SHORTENED (15 chars)
-            placeholder="Enter ban duration (e.g., 7 days)",
-            style=discord.TextStyle.short,
-        )
-        self.add_item(self.reason)
-        self.add_item(self.duration)
-
-    # Ensure you are still using the MINIMAL callback for this test:
-    async def callback(self, interaction: discord.Interaction):
-        print("!!!!!!!!!! MINIMAL CustomPunishmentModal.callback EXECUTED (self.player was disabled in __init__) !!!!!!!!!!!")
-        try:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "Minimal modal callback (player disabled) was reached!",
-                    ephemeral=True
-                )
-                print("!!!!!!!!!! Minimal response sent (player disabled) !!!!!!!!!!!")
-            else:
-                print("!!!!!!!!!! Interaction already done in MINIMAL callback (player disabled)? !!!!!!!!!!!")
-                await interaction.followup.send(
-                    "Modal callback (player disabled) reached, but interaction was done.",
-                    ephemeral=True
-                )
-        except Exception as e:
-            print(f"!!!!!!!!!! ERROR in MINIMAL modal callback (player disabled): {e} !!!!!!!!!!!")
-            import traceback
-            traceback.print_exc()
+    async def on_submit(self, interaction: discord.Interaction):
+        # Get transcripts for custom punishment
+        transcripts = await get_transcript_options(interaction.guild)
+        if transcripts:
+            await interaction.response.send_message("Select a transcript:", view=TranscriptView(transcripts, self.player, self.reason.value, "Custom", self.length.value), ephemeral=True)
+        else:
+            # If no transcripts available, provide default preview
+            response = (
+                f"Transcript link: N/A\n"
+                f"Player(s) being reported: {self.player['Name']}\n"
+                f"BUID: {self.player['BohemiaUID']}\n"
+                f"Verdict/Reason for ban: {self.reason.value}\n"
+                f"Ban Length: (Custom) {self.length.value}"
+            )
+            await interaction.response.send_message(
+                content=f"Preview:\n{response}",
+                view=ConfirmationView(response),
+                ephemeral=True
+            )
 
 # Strike selection
-async def show_strike_menu(
-    interaction: discord.Interaction, player: dict, offense: str
-):
+async def show_strike_menu(interaction: discord.Interaction, player: dict, offense: str):
     class StrikeSelect(discord.ui.Select):
         def __init__(self):
             self.strikes = punishments[offense]
             options = [discord.SelectOption(label=s) for s in self.strikes.keys()]
-            super().__init__(
-                placeholder="Select strike level...",
-                min_values=1,
-                max_values=1,
-                options=options,
-            )
+            super().__init__(placeholder="Select strike level...", min_values=1, max_values=1, options=options)
 
         async def callback(self, interaction2: discord.Interaction):
+            # Delete the strike selection message
             try:
                 await interaction2.message.delete()
-            except discord.NotFound:
-                pass
-            except Exception as e:
-                print(f"Error deleting message: {e}")
+            except:
                 pass
             
-            await interaction2.response.defer(ephemeral=True)
             strike = self.values[0]
             sanctions = self.strikes[strike]
 
             if isinstance(sanctions, list):
-
                 class SanctionSelect(discord.ui.Select):
                     def __init__(self):
                         super().__init__(
                             placeholder="Select ban duration...",
                             min_values=1,
                             max_values=1,
-                            options=[
-                                discord.SelectOption(label=d) for d in sanctions
-                            ],
+                            options=[discord.SelectOption(label=d) for d in sanctions]
                         )
 
                     async def callback(self3, interaction3: discord.Interaction):
+                        # Delete the sanction selection message
                         try:
                             await interaction3.message.delete()
-                        except discord.NotFound:
+                        except:
                             pass
-                        except Exception as e:
-                            print(f"Error deleting message: {e}")
-                            pass
-
-                        await interaction3.response.defer(ephemeral=True)
+                        
                         chosen = self3.values[0]
                         transcripts = await get_transcript_options(interaction3.guild)
-
                         if transcripts:
-                            await interaction3.followup.send(
-                                "Select a transcript:",
-                                view=TranscriptView(
-                                    transcripts, player, offense, strike, chosen
-                                ),
-                                ephemeral=True,
-                            )
+                            await interaction3.response.send_message("Select a transcript:", view=TranscriptView(transcripts, player, offense, strike, chosen), ephemeral=True)
                         else:
-                            link = "N/A"
                             response = (
-                                f"Transcript link: {link}\n"
+                                f"Transcript link: N/A\n"
                                 f"Player(s) being reported: {player['Name']}\n"
                                 f"BUID: {player['BohemiaUID']}\n"
                                 f"Verdict/Reason for ban: {offense}\n"
                                 f"Ban Length: ({strike}) {chosen}"
                             )
-                            await interaction3.followup.send(
-                                content=f"Preview:\n{response}",
-                                view=ConfirmationView(response),
-                                ephemeral=True,
-                            )
+                            await interaction3.response.send_message(content=f"Preview:\n{response}", view=ConfirmationView(response), ephemeral=True)
 
                 class SanctionView(discord.ui.View):
                     def __init__(self):
                         super().__init__()
                         self.add_item(SanctionSelect())
 
-                await interaction2.followup.send(
-                    "Select a ban duration:", view=SanctionView(), ephemeral=True
-                )
+                await interaction2.response.send_message("Select a ban duration:", view=SanctionView(), ephemeral=True)
             else:
                 transcripts = await get_transcript_options(interaction2.guild)
                 if transcripts:
-                    await interaction2.followup.send(
-                        "Select a transcript:",
-                        view=TranscriptView(
-                            transcripts, player, offense, strike, sanctions
-                        ),
-                        ephemeral=True,
-                    )
+                    await interaction2.response.send_message("Select a transcript:", view=TranscriptView(transcripts, player, offense, strike, sanctions), ephemeral=True)
                 else:
-                    # No transcripts found, so just send preview immediately
-                    link = "N/A"
                     response = (
-                        f"Transcript link: {link}\n"
+                        f"Transcript link: N/A\n"
                         f"Player(s) being reported: {player['Name']}\n"
                         f"BUID: {player['BohemiaUID']}\n"
                         f"Verdict/Reason for ban: {offense}\n"
                         f"Ban Length: ({strike}) {sanctions}"
                     )
-                    await interaction2.followup.send(
-                        content=f"Preview:\n{response}",
-                        view=ConfirmationView(response),
-                        ephemeral=True,
-                    )
+                    await interaction2.response.send_message(content=f"Preview:\n{response}", view=ConfirmationView(response), ephemeral=True)
 
     class StrikeView(discord.ui.View):
         def __init__(self):
             super().__init__()
             self.add_item(StrikeSelect())
 
-    await interaction.followup.send(
-        "Select the strike level:", view=StrikeView(), ephemeral=True
-    )
-
+    await interaction.followup.send("Select the strike level:", view=StrikeView(), ephemeral=True)
 
 # Offense selection
 async def show_offense_menu(interaction: discord.Interaction, player: dict):
     class OffenseSelect(discord.ui.Select):
         def __init__(self):
             options = [discord.SelectOption(label=o) for o in punishments.keys()]
-            super().__init__(
-                placeholder="Select offense...",
-                min_values=1,
-                max_values=1,
-                options=options,
-            )
+            super().__init__(placeholder="Select offense...", min_values=1, max_values=1, options=options)
 
         async def callback(self, interaction2: discord.Interaction):
+            # Delete the offense selection message
             try:
                 await interaction2.message.delete()
-            except discord.NotFound:
-                pass
-            except Exception as e:
-                print(f"Error deleting message: {e}")
+            except:
                 pass
             
             offense = self.values[0]
             if offense == "Custom Punishment":
-                modal = CustomPunishmentModal(player)
-                print(f"ℹ️ Attempting to send modal instance: {modal} with title '{modal.title}'")
-                try:
-                    await interaction2.response.send_modal(modal)
-                    print(f"✅ Modal for custom punishment sent successfully for interaction {interaction2.id}.")
-                except Exception as e_send_modal:
-                    print(f"❌ ERROR trying to send modal: {e_send_modal}")
-                    import traceback
-                    traceback.print_exc()
-                return 
-                await interaction2.response.send_modal(modal)  # This is the immediate response
-                return  # Crucial: return here, don't try to send another response
-
-            await interaction2.response.defer(ephemeral=True)  # Defer only if not sending modal
+                await interaction2.response.send_modal(CustomPunishmentModal(player))
+                return
+            
+            await interaction2.response.defer(ephemeral=True)
             await show_strike_menu(interaction2, player, offense)
 
     class OffenseView(discord.ui.View):
@@ -484,16 +277,10 @@ async def show_offense_menu(interaction: discord.Interaction, player: dict):
             super().__init__()
             self.add_item(OffenseSelect())
 
-    await interaction.followup.send(
-        "Select the offense:", view=OffenseView(), ephemeral=True
-    )
-
+    await interaction.followup.send("Select the offense:", view=OffenseView(), ephemeral=True)
 
 # Slash command: /buildbanform
-@tree.command(
-    name="buildbanform",
-    description="Build a formatted ban form from latest player info",
-)
+@tree.command(name="buildbanform", description="Build a formatted ban form from latest player info")
 async def buildbanform(interaction: discord.Interaction):
     players = []
     for channel in interaction.guild.text_channels:
@@ -503,76 +290,46 @@ async def buildbanform(interaction: discord.Interaction):
                     lines = message.content.replace(",", "\n").splitlines()
                     for line in lines:
                         parts = line.strip().split(" | ")
-                        player_data = {} # Renamed to avoid conflict with outer 'player' variable in other scopes
+                        player = {}
                         for part in parts:
                             if " = " in part:
                                 k, v = part.split(" = ", 1)
-                                player_data[k.strip()] = v.strip()
-                        if all(
-                            k in player_data
-                            for k in ("Name", "Level", "Last Played", "BohemiaUID")
-                        ):
-                            players.append(player_data)
-                    if players: # Found players in this message, no need to check more messages in this channel
-                        break 
+                                player[k.strip()] = v.strip()
+                        if all(k in player for k in ("Name", "Level", "Last Played", "BohemiaUID")):
+                            players.append(player)
+                    if players:
+                        break
         except (discord.Forbidden, discord.HTTPException):
-            continue # Move to the next channel if permission denied or other HTTP error
-        if players: # Found players in the previous channel, no need to check more channels
+            continue
+        if players:
             break
 
     if not players:
-        await interaction.response.send_message(
-            "No valid player data found.", ephemeral=True
-        )
+        await interaction.response.send_message("No valid player data found.", ephemeral=True)
         return
 
     class PlayerSelect(discord.ui.Select):
         def __init__(self):
-            options = [
-                discord.SelectOption(
-                    label=p["Name"],
-                    description=f"Level {p['Level']} - {p['Last Played']}",
-                )
-                for p in players # Uses the 'players' list from the outer scope
-            ]
-            super().__init__(
-                placeholder="Choose a player...",
-                min_values=1,
-                max_values=1,
-                options=options,
-            )
+            options = [discord.SelectOption(label=p["Name"], description=f"Level {p['Level']} - {p['Last Played']}") for p in players]
+            super().__init__(placeholder="Choose a player...", min_values=1, max_values=1, options=options)
 
         async def callback(self, interaction2: discord.Interaction):
+            # Delete the player selection message
             try:
                 await interaction2.message.delete()
-            except discord.NotFound:
-                pass
-            except Exception as e:
-                print(f"Error deleting message: {e}")
+            except:
                 pass
             
             await interaction2.response.defer(ephemeral=True)
-            # Uses 'players' from the outer scope of buildbanform
-            selected_player_obj = next(p for p in players if p["Name"] == self.values[0])
-            await show_offense_menu(interaction2, selected_player_obj)
+            player = next(p for p in players if p["Name"] == self.values[0])
+            await show_offense_menu(interaction2, player)
 
     class PlayerView(discord.ui.View):
         def __init__(self):
             super().__init__()
             self.add_item(PlayerSelect())
 
-    await interaction.response.send_message(
-        "Select a player to generate the ban form:",
-        view=PlayerView(),
-        ephemeral=True,
-    )
-
+    await interaction.response.send_message("Select a player to generate the ban form:", view=PlayerView(), ephemeral=True)
 
 # Run the bot
-if __name__ == "__main__": # Good practice to include this
-    # Ensure the DISCORD_TOKEN environment variable is set
-    DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-    if DISCORD_TOKEN is None:
-        print("❌ Error: DISCORD_TOKEN environment variable not set.")
-    else:
-        bot.run(DISCORD_TOKEN)
+bot.run(os.getenv("DISCORD_TOKEN"))
