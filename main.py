@@ -23,13 +23,17 @@ async def on_ready():
     except Exception as e:
         print(f"❌ Failed to sync commands: {e}")
 
-def generate_transcript_link(message: discord.Message, *args) -> str:
+def generate_transcript_link(message: discord.Message, channel_name: str, *args) -> str:
     for attachment in message.attachments:
         if attachment.filename.endswith(".html"):
             match = re.search(r"(\d+)", attachment.filename)
             if match:
-                report_number = int(match.group(1))
-                return f"[Report-{report_number:04d}](<{message.jump_url}>)"
+                number = int(match.group(1))
+                # Determine prefix based on channel name
+                if "ticket" in channel_name.lower():
+                    return f"[Ticket-{number:04d}](<{message.jump_url}>)"
+                else:
+                    return f"[Report-{number:04d}](<{message.jump_url}>)"
     return f"[Transcript](<{message.jump_url}>)"
 
 async def get_transcript_options(guild: discord.Guild, channel_name_contains="transcript") -> list[str]:
@@ -41,7 +45,8 @@ async def get_transcript_options(guild: discord.Guild, channel_name_contains="tr
     async for message in transcript_channel.history(limit=50):
         if message.attachments:
             if any(att.filename.endswith(".html") for att in message.attachments):
-                transcripts.append(generate_transcript_link(message, index))
+                # Pass channel name to generate_transcript_link
+                transcripts.append(generate_transcript_link(message, transcript_channel.name, index))
                 index += 1
         if len(transcripts) >= 5:
             break
@@ -59,8 +64,6 @@ class ConfirmationButton(discord.ui.Button):
         self.unban_data = unban_data
 
     async def callback(self, interaction: discord.Interaction):
-        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-        
         # Handle unban logic
         if self.unban_data:
             if self.unban_data['remove_strike']:
@@ -100,7 +103,6 @@ class ConfirmationButton(discord.ui.Button):
         final_response = (
             f"{self.response_text}\n"
             f"Submitted by: {interaction.user.mention}\n"
-            f"Time Submitted: {timestamp}\n"
             f"Ban ID: #{ban_id:04d}"
         )
         
@@ -156,6 +158,86 @@ class BackButton(discord.ui.Button):
             await interaction.response.send_message("Select the offense:", view=OffenseView(state['player']), ephemeral=True)
         elif self.back_to == "strike":
             await interaction.response.send_message("Select the strike level:", view=StrikeView(state['player'], state['offense']), ephemeral=True)
+        elif self.back_to == "transcript_type":
+            await interaction.response.send_message("Select transcript type:", view=TranscriptTypeView(state['player'], state['offense'], state['strike'], state['sanction'], state.get('unban_data')), ephemeral=True)
+
+class TranscriptTypeSelect(discord.ui.Select):
+    def __init__(self, player: dict, offense: str, strike: str, sanction: str, unban_data: dict = None):
+        self.player = player
+        self.offense = offense
+        self.strike = strike
+        self.sanction = sanction
+        self.unban_data = unban_data
+        
+        # Report transcripts appear first (on top)
+        options = [
+            discord.SelectOption(
+                label="Report Transcript", 
+                value="report-transcripts",
+                description="Transcripts from report investigations"
+            ),
+            discord.SelectOption(
+                label="Ticket Transcript", 
+                value="ticket-transcripts",
+                description="Transcripts from player appeals/tickets"
+            )
+        ]
+        
+        super().__init__(placeholder="Select transcript type...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            await interaction.message.delete()
+        except:
+            pass
+        
+        transcript_type = self.values[0]
+        
+        # Get transcripts from the selected channel type
+        transcripts = await get_transcript_options(interaction.guild, transcript_type)
+        
+        if transcripts:
+            await interaction.response.send_message(
+                f"Select a transcript from {transcript_type}:", 
+                view=TranscriptView(transcripts, self.player, self.offense, self.strike, self.sanction, self.unban_data), 
+                ephemeral=True
+            )
+        else:
+            # No transcripts found, proceed without transcript
+            response = (
+                f"Transcript link: N/A\n"
+                f"Player(s) being reported: {self.player['Name']}\n"
+                f"BUID: {self.player['BohemiaUID']}\n"
+                f"Verdict/Reason for ban: {self.offense}\n"
+                f"Ban Length: ({self.strike}) {self.sanction}"
+            )
+            
+            if self.unban_data:
+                response += f"\nRelated to Ban #{self.unban_data['ban_id']:04d}"
+                
+                # Check for previous bans (skip for unbans)
+                history_note = ""
+            else:
+                previous_strikes = ban_tracker.get_player_strikes(self.player['BohemiaUID'])
+                if previous_strikes > 0:
+                    response += f"\n⚠️ **Previous Strikes:** {previous_strikes}"
+            
+            await interaction.response.send_message(
+                content=f"No transcripts found in {transcript_type}.\n\nPreview:\n{response}", 
+                view=ConfirmationView(response, self.player, self.offense, self.strike, self.sanction, "N/A", self.unban_data), 
+                ephemeral=True
+            )
+
+class TranscriptTypeView(discord.ui.View):
+    def __init__(self, player: dict, offense: str, strike: str, sanction: str, unban_data: dict = None):
+        super().__init__()
+        self.add_item(TranscriptTypeSelect(player, offense, strike, sanction, unban_data))
+        
+        # Determine what to go back to
+        if unban_data:
+            self.add_item(BackButton("offense"))  # For unbans, go back to report selection (which goes back to offense)
+        else:
+            self.add_item(BackButton("strike"))   # For regular bans, go back to strike selection
 
 class UnbanReportSelect(discord.ui.Select):
     def __init__(self, player_buid: str, unban_type: str):
@@ -182,7 +264,7 @@ class UnbanReportSelect(discord.ui.Select):
             options.append(discord.SelectOption(label="No bans found for this player", value="none", description="Cannot proceed"))
         
         super().__init__(
-            placeholder=f"Select report to unban{'(remove strike)' if self.remove_strike else '(keep strike)'}...",
+            placeholder=f"Select report to unban {'(remove strike)' if self.remove_strike else '(keep strike)'}...",
             min_values=1,
             max_values=1,
             options=options
@@ -202,34 +284,23 @@ class UnbanReportSelect(discord.ui.Select):
         user_id = interaction.user.id
         state = user_form_state[user_id]
         
-        # Store unban data
+        # Store unban data and proceed to transcript type selection
         unban_data = {
             'ban_id': ban_id,
             'remove_strike': self.remove_strike
         }
         
-        # Get transcripts and proceed
-        transcripts = await get_transcript_options(interaction.guild)
-        if transcripts:
-            await interaction.response.send_message(
-                "Select a transcript:", 
-                view=TranscriptView(transcripts, state['player'], self.unban_type, "UNBAN", "Player Unbanned", unban_data), 
-                ephemeral=True
-            )
-        else:
-            response = (
-                f"Transcript link: N/A\n"
-                f"Player(s) being reported: {state['player']['Name']}\n"
-                f"BUID: {state['player']['BohemiaUID']}\n"
-                f"Verdict/Reason for ban: {self.unban_type}\n"
-                f"Ban Length: (UNBAN) Player Unbanned\n"
-                f"Related to Ban #{ban_id:04d}"
-            )
-            await interaction.response.send_message(
-                content=f"Preview:\n{response}", 
-                view=ConfirmationView(response, state['player'], self.unban_type, "UNBAN", "Player Unbanned", "N/A", unban_data), 
-                ephemeral=True
-            )
+        # Update form state with unban data
+        user_form_state[user_id]['unban_data'] = unban_data
+        user_form_state[user_id]['strike'] = "UNBAN"
+        user_form_state[user_id]['sanction'] = "Player Unbanned"
+        
+        # Go to transcript type selection
+        await interaction.response.send_message(
+            "Select transcript type:", 
+            view=TranscriptTypeView(state['player'], self.unban_type, "UNBAN", "Player Unbanned", unban_data), 
+            ephemeral=True
+        )
 
 class UnbanReportView(discord.ui.View):
     def __init__(self, player_buid: str, unban_type: str):
@@ -257,68 +328,23 @@ class TranscriptBackButton(discord.ui.Button):
             'player': self.player,
             'offense': self.offense,
             'strike': self.strike,
+            'sanction': self.sanction,
+            'unban_data': self.unban_data,
             'players': user_form_state.get(interaction.user.id, {}).get('players', [])
         }
         
-        # Handle unban back navigation
-        if self.unban_data:
-            await interaction.response.send_message(
-                "Select which report to unban:", 
-                view=UnbanReportView(self.player['BohemiaUID'], self.offense), 
-                ephemeral=True
-            )
-            return
-        
-        # Check if we need to go back to sanction selection or strike selection
-        sanctions = punishments[self.offense][self.strike]
-        
-        if isinstance(sanctions, list):
-            # Go back to sanction selection
-            class BackSanctionSelect(discord.ui.Select):
-                def __init__(self):
-                    super().__init__(
-                        placeholder="Select ban duration...",
-                        min_values=1,
-                        max_values=1,
-                        options=[discord.SelectOption(label=d) for d in sanctions]
-                    )
-
-                async def callback(self3, interaction3: discord.Interaction):
-                    try:
-                        await interaction3.message.delete()
-                    except:
-                        pass
-                    
-                    chosen = self3.values[0]
-                    transcripts = await get_transcript_options(interaction3.guild)
-                    if transcripts:
-                        await interaction3.response.send_message("Select a transcript:", view=TranscriptView(transcripts, self.player, self.offense, self.strike, chosen), ephemeral=True)
-                    else:
-                        response = (
-                            f"Transcript link: N/A\n"
-                            f"Player(s) being reported: {self.player['Name']}\n"
-                            f"BUID: {self.player['BohemiaUID']}\n"
-                            f"Verdict/Reason for ban: {self.offense}\n"
-                            f"Ban Length: ({self.strike}) {chosen}"
-                        )
-                        await interaction3.response.send_message(content=f"Preview:\n{response}", view=ConfirmationView(response, self.player, self.offense, self.strike, chosen, "N/A"), ephemeral=True)
-
-            class BackSanctionView(discord.ui.View):
-                def __init__(self):
-                    super().__init__()
-                    self.add_item(BackSanctionSelect())
-                    self.add_item(BackButton("strike"))
-
-            await interaction.response.send_message("Select a ban duration:", view=BackSanctionView(), ephemeral=True)
-        else:
-            # Go back directly to strike selection
-            await interaction.response.send_message("Select the strike level:", view=StrikeView(self.player, self.offense), ephemeral=True)
+        # Go back to transcript type selection
+        await interaction.response.send_message(
+            "Select transcript type:", 
+            view=TranscriptTypeView(self.player, self.offense, self.strike, self.sanction, self.unban_data), 
+            ephemeral=True
+        )
 
 class ConfirmationView(discord.ui.View):
     def __init__(self, response_text: str, player_data: dict, offense: str, strike: str, sanction: str, transcript: str, unban_data: dict = None):
         super().__init__()
         self.add_item(ConfirmationButton(response_text, player_data, offense, strike, sanction, transcript, unban_data))
-        self.add_item(BackButton("strike"))
+        self.add_item(BackButton("transcript_type"))  # Back to transcript type selection
         self.add_item(CancelButton())
 
 class TranscriptSelect(discord.ui.Select):
@@ -409,22 +435,17 @@ class CustomPunishmentModal(discord.ui.Modal, title="Custom Punishment Entry"):
         self.player = player
 
     async def on_submit(self, interaction: discord.Interaction):
-        transcripts = await get_transcript_options(interaction.guild)
-        if transcripts:
-            await interaction.response.send_message("Select a transcript:", view=TranscriptView(transcripts, self.player, self.reason.value, "Custom", self.length.value), ephemeral=True)
-        else:
-            response = (
-                f"Transcript link: N/A\n"
-                f"Player(s) being reported: {self.player['Name']}\n"
-                f"BUID: {self.player['BohemiaUID']}\n"
-                f"Verdict/Reason for ban: {self.reason.value}\n"
-                f"Ban Length: (Custom) {self.length.value}"
-            )
-            await interaction.response.send_message(
-                content=f"Preview:\n{response}",
-                view=ConfirmationView(response, self.player, self.reason.value, "Custom", self.length.value, "N/A"),
-                ephemeral=True
-            )
+        # Update form state for custom punishment
+        user_form_state[interaction.user.id]['offense'] = self.reason.value
+        user_form_state[interaction.user.id]['strike'] = "Custom"
+        user_form_state[interaction.user.id]['sanction'] = self.length.value
+        
+        # Go to transcript type selection
+        await interaction.response.send_message(
+            "Select transcript type:", 
+            view=TranscriptTypeView(self.player, self.reason.value, "Custom", self.length.value), 
+            ephemeral=True
+        )
 
 # Updated View classes to be standalone
 class StrikeView(discord.ui.View):
@@ -479,18 +500,16 @@ class StrikeSelect(discord.ui.Select):
                         pass
                     
                     chosen = self3.values[0]
-                    transcripts = await get_transcript_options(interaction3.guild)
-                    if transcripts:
-                        await interaction3.response.send_message("Select a transcript:", view=TranscriptView(transcripts, self.player, self.offense, strike, chosen), ephemeral=True)
-                    else:
-                        response = (
-                            f"Transcript link: N/A\n"
-                            f"Player(s) being reported: {self.player['Name']}\n"
-                            f"BUID: {self.player['BohemiaUID']}\n"
-                            f"Verdict/Reason for ban: {self.offense}\n"
-                            f"Ban Length: ({strike}) {chosen}"
-                        )
-                        await interaction3.response.send_message(content=f"Preview:\n{response}", view=ConfirmationView(response, self.player, self.offense, strike, chosen, "N/A"), ephemeral=True)
+                    
+                    # Update form state and go to transcript type selection
+                    user_form_state[interaction3.user.id]['strike'] = strike
+                    user_form_state[interaction3.user.id]['sanction'] = chosen
+                    
+                    await interaction3.response.send_message(
+                        "Select transcript type:", 
+                        view=TranscriptTypeView(self.player, self.offense, strike, chosen), 
+                        ephemeral=True
+                    )
 
             class SanctionView(discord.ui.View):
                 def __init__(self):
@@ -499,18 +518,15 @@ class StrikeSelect(discord.ui.Select):
 
             await interaction.response.send_message("Select a ban duration:", view=SanctionView(), ephemeral=True)
         else:
-            transcripts = await get_transcript_options(interaction.guild)
-            if transcripts:
-                await interaction.response.send_message("Select a transcript:", view=TranscriptView(transcripts, self.player, self.offense, strike, sanctions), ephemeral=True)
-            else:
-                response = (
-                    f"Transcript link: N/A\n"
-                    f"Player(s) being reported: {self.player['Name']}\n"
-                    f"BUID: {self.player['BohemiaUID']}\n"
-                    f"Verdict/Reason for ban: {self.offense}\n"
-                    f"Ban Length: ({strike}) {sanctions}"
-                )
-                await interaction.response.send_message(content=f"Preview:\n{response}", view=ConfirmationView(response, self.player, self.offense, strike, sanctions, "N/A"), ephemeral=True)
+            # Update form state and go to transcript type selection
+            user_form_state[interaction.user.id]['strike'] = strike
+            user_form_state[interaction.user.id]['sanction'] = sanctions
+            
+            await interaction.response.send_message(
+                "Select transcript type:", 
+                view=TranscriptTypeView(self.player, self.offense, strike, sanctions), 
+                ephemeral=True
+            )
 
 class OffenseView(discord.ui.View):
     def __init__(self, player: dict):
