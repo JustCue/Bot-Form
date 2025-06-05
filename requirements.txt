@@ -1,3 +1,31 @@
+# Discord Library
 discord.py
+
+# Database Libraries
+aiomysql
+PyMySQL
+
+# Environment Management
 python-dotenv
-asyncpg
+
+# Date/Time Utilities
+python-dateutil
+
+# Async HTTP Client (for future API integrations)
+aiohttp
+
+# JSON/Data Handling
+ujson
+
+# Logging and Utilities
+colorama
+tabulate
+
+# Optional: Performance Monitoring
+psutil
+
+# Optional: Enhanced Regex Support
+regex
+
+# Optional: Better Error Handling
+sentry-sdk
