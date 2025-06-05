@@ -2,31 +2,7 @@
 
 punishments = {
     "Custom Punishment": {},
-    "Spamming": {
-        "Strike 1": "30‑Min /timeout",
-        "Strike 2": "1 Day Ban",
-        "Strike 3": "1 Month Ban",
-        "Strike 4": "Permanent Ban"
-    },
-    "Prohibited Messages & Links": {
-        "Strike 1": "1 Hour /timeout",
-        "Strike 2": "24 Hour /timeout",
-        "Strike 3": "7 Day Ban",
-        "Strike 4": "Permanent Ban"
-    },
-    "Advertising": {
-        "Strike 1": "3 Hour /timeout",
-        "Strike 2": "24 Hour /timeout",
-        "Strike 3": "7 Day Ban",
-        "Strike 4": "Permanent Ban"
-    },
-    "Staff Disrespect": {
-        "Strike 1": "4 Hour /timeout",
-        "Strike 2": "25 Hour /timeout",
-        "Strike 3": "7 Day Ban",
-        "Strike 4": "Permanent Ban"
-    },
-    "Team Killing": {
+       "Team Killing": {
         "Strike 1": ["3 Day Ban", "4 Day Ban", "5 Day Ban", "6 Day Ban", "7 Day Ban"],
         "Strike 2": "1 Month Ban",
         "Strike 3": "1 Year Ban",
